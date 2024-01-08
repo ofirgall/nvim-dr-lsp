@@ -4,36 +4,96 @@ local fn = vim.fn
 --------------------------------------------------------------------------------
 
 local lspCount = {}
+local uv = vim.loop
+
+local function calc_request(elements, uri_key, range_key, curr)
+	local res = {
+		file = 0,
+		workspace = 0,
+		location = 0,
+	}
+	local loc = 0
+	if not elements then return res end
+	res.workspace = #elements
+
+	for _, e in pairs(elements) do
+		if e[uri_key] == curr.uri then
+			res.file = res.file + 1
+			local range = e[range_key]
+
+			if range.start.line < curr.line then
+				-- In a previous line
+				loc = loc + 1
+			elseif range.start.line == curr.line then
+				-- In current line
+
+				if range.start.character <= curr.character then
+					-- Previous range in same line
+					loc = loc + 1
+					if curr.line == range["end"].line and curr.character < range["end"].character then
+						-- In current word
+						res.location = loc
+					end
+				end
+			end
+		end
+	end
+
+	return res
+end
+
+local function request_finished(finish_callback)
+	if finish_callback and lspCount.references ~= nil and lspCount.definitions ~= nil then
+		if lspCount.references.location > 0 then
+			lspCount.location = {
+				type = "references",
+				index = lspCount.references.location,
+			}
+		elseif lspCount.definitions.location > 0 then
+			lspCount.location = {
+				type = "definitions",
+				index = lspCount.definitions.location,
+			}
+		else
+			lspCount.location = {}
+		end
+		finish_callback()
+	end
+end
 
 ---calculate number of references for entity under cursor asynchronously
 ---@async
-local function requestLspRefCount()
+local function requestLspRefCount(finish_callback)
 	if fn.mode() ~= "n" then
 		lspCount = {}
 		return
 	end
 	local params = lsp.util.make_position_params(0) ---@diagnostic disable-line: missing-parameter
 	params.context = { includeDeclaration = false }
-	local thisFileUri = vim.uri_from_fname(fn.expand("%:p")) -- identifier in LSP response
+
+	local cursor = vim.api.nvim_win_get_cursor(0)
+
+	local curr = {
+		-- identifier in LSP response
+		uri = vim.uri_from_fname(fn.expand("%:p")),
+
+		-- Minus 1 because lsp lines are indexed by 0
+		line = cursor[1] - 1,
+		character = cursor[2],
+	}
 
 	lsp.buf_request(0, "textDocument/references", params, function(error, refs)
-		lspCount.refFile = 0
-		lspCount.refWorkspace = 0
-		if not error and refs then
-			lspCount.refWorkspace = #refs
-			for _, ref in pairs(refs) do
-				if thisFileUri == ref.uri then lspCount.refFile = lspCount.refFile + 1 end
-			end
+		if not error then
+			lspCount.references = calc_request(refs, "uri", "range", curr)
+
+			request_finished(finish_callback)
 		end
 	end)
 	lsp.buf_request(0, "textDocument/definition", params, function(error, defs)
-		lspCount.defFile = 0
-		lspCount.defWorkspace = 0
-		if not error and defs then
-			lspCount.defWorkspace = #defs
-			for _, def in pairs(defs) do
-				if thisFileUri == def.targetUri then lspCount.defFile = lspCount.defFile + 1 end
-			end
+		if not error then
+			lspCount.definitions = calc_request(defs, "targetUri", "targetRange", curr)
+
+			request_finished(finish_callback)
 		end
 	end)
 end
@@ -65,19 +125,55 @@ function M.lspCount()
 	return "LSP: " .. defs .. " " .. refs
 end
 
+local function lspCountToResult()
+	if lspCount.references.workspace == 0 and lspCount.definitions.workspace == 0 then return nil end
+	if not lspCount.references.workspace then return nil end
+
+	return {
+		file = {
+			definitions = lspCount.definitions.file,
+			references = lspCount.references.file,
+		},
+		workspace = {
+			definitions = lspCount.definitions.workspace,
+			references = lspCount.references.workspace,
+		},
+		location = {
+			type = lspCount.location.type,
+			index = lspCount.location.index,
+		},
+	}
+end
+
 ---@class LspCountSingleResult
 ---@field definitions number amount of definitions
 ---@field references number amount of references
 
+---@class LspCountLocationResult
+---@field type string location type (definitions|references)
+---@field index number location index of the references/definitions
+
 ---@class LspCountResult
 ---@field file LspCountSingleResult local file result
 ---@field workspace LspCountSingleResult workspace result
+---@field location LspCountLocationResult workspace result
+
+local lastLspCount = 0
 
 ---Returns the number of definitions/references as identified by LSP as table
 ---for the current file and for the whole workspace.
 ---@return LspCountResult? table contains the lsp count results
----@nodiscard
-function M.lspCountTable()
+function M.lspCountTable(throttle, on_finish_callback)
+	if throttle then
+		local now = uv.now()
+		if now - lastLspCount < throttle then
+			-- return last lsp count in cache
+			return lspCountToResult()
+		end
+		lastLspCount = now
+		-- print("new lsp results " .. uv.now())
+	end
+
 	-- abort when lsp loading or not capable of references
 	local currentBufNr = fn.bufnr()
 	local bufClients = lsp.get_active_clients { bufnr = currentBufNr }
@@ -92,20 +188,9 @@ function M.lspCountTable()
 	if vim.api.nvim_get_mode().mode ~= "n" or lspLoading or not lspCapable then return nil end
 
 	-- trigger count, abort when none
-	requestLspRefCount() -- needs to be separated due to lsp calls being async
-	if lspCount.refWorkspace == 0 and lspCount.defWorkspace == 0 then return nil end
-	if not lspCount.refWorkspace then return nil end
+	requestLspRefCount(on_finish_callback) -- needs to be separated due to lsp calls being async
 
-	return {
-		file = {
-			definitions = lspCount.defFile,
-			references = lspCount.refFile,
-		},
-		workspace = {
-			definitions = lspCount.defWorkspace,
-			references = lspCount.refWorkspace,
-		},
-	}
+	return lspCountToResult()
 end
 
 --------------------------------------------------------------------------------
